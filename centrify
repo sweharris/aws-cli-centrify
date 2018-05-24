@@ -1,0 +1,424 @@
+#!/bin/bash
+#
+# GPLv2 or later, at your preference
+#
+# Stephen Harris, May 2018
+
+############################################################################
+#
+# Perform Centrify 2FA login, determine what AWS roles you have, let's you
+# select one and then gets the Amazon temporary tokens.  They are passed
+# on stdout as
+#  unset AWS_PROFILE ; 
+#    export AWS_SESSION_TOKEN=$session
+#           AWS_SECRET_ACCESS_KEY=$secret
+#           AWS_ACCESS_KEY_ID=$access
+# (all on one line)
+# so this script should be called inside eval
+#
+# Configuration variables:
+#   CENTRIFY_ENDPOINT  - should be something like "myaccountid.my.centrify.com"
+#   CENTRIFY_APPKEY    - should be the Centrify Application ID for the connector
+#   CENTRIFY_USER      - Used if $1 is not passed.  Should be your Centrify
+#                        login ID
+#
+# Requirements:
+#    jq  - available in EPEL for RedHat
+#    base64 - to read the SAML response
+#    curl - to talk to Centrify
+#    aws  - the Standard aws CLI tool to get the identity tokens
+#
+# How it works:
+#   1: Calls /Security/StartAuthentication to get a session
+#      If we're not using the correct URL then get that and restart
+#   2: For each challenge listed, get the necessary authentication
+#   3: Use the resulting Bearer token to call the application "tile"
+#   4: Use the resulting SAML response to provide a list of roles
+#   5: Use "sts" to assume that role, using the SAML data
+#
+############################################################################
+
+############################################################################
+#
+# Simple utility functions
+#
+############################################################################
+
+prompt()
+{
+  echo "$@" > /dev/tty
+}
+
+prompt_nocr()
+{
+  echo -n "$@" > /dev/tty
+}
+
+error()
+{
+  echo "$@" >&2
+  exit 255
+}
+
+# Quotes the 5 magic characters that might break the XML
+fix_xml()
+{
+  echo "$@" | sed -e 's/&/\&amp;/g' -e 's/"/\&quot;/g' -e "s/'/\\&apos;/g" -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# Simple call to the Centrify endpoint
+do_curl()
+{
+  $CURL -s -S https://$ENDPOINT$1 -d "$2"
+}
+
+do_curl_auth()
+{
+  $CURL -s -S -H "Authorization: Bearer $2" https://$ENDPOINT$1
+}
+
+############################################################################
+#
+# User choice selection
+#
+# Pass it a prompt and an array of values, and it'll let you select the one you want by number.
+# Used by the "select authenticator" routine and the "select role" routine.  If you only have
+# one option then it returns that one immediately.  Result is indexed from 0, because that's how
+# bash arrays work
+#
+############################################################################
+
+select_options()
+{
+  typeset prmpt=$1
+  shift
+  typeset options=$#
+  typeset -a choices=("$@")
+
+  # Only one option?  Select it
+  if [ $# == 1 ]
+  then
+    return 0
+  fi
+
+  typeset chose=-1
+  while [ $chose -lt 1 -o $chose -gt $options ]
+  do
+    chose=0
+    prompt
+    prompt "$prmpt: "
+    while (( chose < options ))
+    do
+      typeset o=${choices[$chose]}
+      let chose=chose+1
+      prompt "   $chose: $o"
+    done
+    prompt_nocr "Enter choice: "
+    read chose < /dev/tty
+    if [ "$chose" -eq "$chose" ] 2>/dev/null
+    then
+      if [ $chose -lt 1 -o $chose -gt $options ]
+      then
+        prompt "Bad choice.  Retry"
+      fi
+    else
+      prompt "Not a number.  Retry"
+      chose=0
+    fi
+  done
+
+  let chose=chose-1
+  echo $chose
+}
+
+############################################################################
+#
+# Verify all the necessary binaries are present and that we're running
+# on a terminal
+#
+############################################################################
+
+setup()
+{
+  # Stdin needs to be a terminal so user can enter password.  If that is
+  # then we can assume /dev/tty is good for output as well
+  if [ ! -t 0 ]
+  then
+    error "STDIN needs to be connected to a terminal"
+  fi
+
+  # Variables from the environment
+  ENDPOINT=${CENTRIFY_ENDPOINT}
+  APPKEY=${CENTRIFY_APPKEY}
+  USER=${1:-$CENTRIFY_USER}
+
+  if [ -z "$ENDPOINT" ]
+  then
+    error "CENTRIFY_ENDPOINT is not defined"
+  fi
+
+  if [ -z "$APPKEY" ]
+  then
+    error "CENTRIFY_APPKEY is not defined"
+  fi
+
+  if [ -z "$USER" ]
+  then
+    error "CENTRIFY_USER is not defined and no user passed"
+  fi
+
+  # We need the `jq` program to process JSON output
+  JQ=$(type -path jq)
+  if [ -z "$JQ" ]
+  then
+    error "Missing dependency: jq"
+  fi
+
+  # We need curl to talk to web services
+  CURL=$(type -path curl)
+  if [ -z "$CURL" ]
+  then
+    error "Missing dependency: curl"
+  fi
+
+  # Base64 to decode the SAML
+  BASE64=$(type -path base64)
+  if [ -z "$BASE64" ]
+  then
+    error "Missing dependency: base64"
+  fi
+ 
+  # And the aws command to talk to Amazon
+  AWS=$(type -path aws)
+  if [ -z "$AWS" ]
+  then
+    error "Missing dependency: aws"
+  fi
+
+  # Make sure we don't have any old credentials
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+  prompt Using $ENDPOINT for user $USER
+}
+
+############################################################################
+#
+# Centrify API has a "success" boolean that indicates success or failure
+# On success the API returns everything under the "Result" key, so let's
+# just return that
+#
+############################################################################
+
+test_success()
+{
+  typeset json=$1
+  typeset phase=$2
+
+  set -- $(echo "$json" | $JQ -r '"\(.success) \(.Message)"')
+  if [ "$1" != "true" ]
+  then
+    shift
+    error "
+Failed during phase: $phase
+
+$@"
+  fi
+
+  echo "$json" | $JQ -r '.Result'
+}
+
+############################################################################
+#
+# This is how a new session is started.
+#
+############################################################################
+
+# Start Authentication
+do_start()
+{
+  typeset start=$(do_curl /Security/StartAuthentication '{"Version": "1.0", "User": "'$USER'"}')
+  test_success "$start" "Starting Authentication"
+}
+
+############################################################################
+#
+# This goes through one element of the "Challenges" array.  The main loop
+# calls these in order.  This gives us our multi-factor.  We let the user
+# choose their challenege.  If it's "Text" then it's a password and we
+# request that.  If it's Out-Of-Band then we call the API and then loop,
+# polling for OOB completion.
+#
+############################################################################
+
+do_challenge()
+{
+  typeset count=$1
+  typeset tenant=$2
+  typeset session=$3
+  typeset challenge=$4
+
+  # Build the array of options the user can pick
+  typeset -a options=()
+  typeset chose
+
+  while read -r chose
+  do
+    options+=("$chose")
+  done < <(echo "$challenge" | $JQ '.[] | .PromptSelectMech')
+      
+  chose=$(select_options "Select authentication method" "${options[@]}")
+
+  typeset mech_id=$(echo "$challenge" | $JQ -r '.['$chose'] | .MechanismId')
+  typeset answer_type=$(echo "$challenge" | $JQ -r '.['$chose'] | .AnswerType')
+  typeset prompt=$(echo "$challenge" | $JQ -r '.['$chose'] | .PromptMechChosen')
+  typeset action
+
+  if [ $answer_type == "Text" ]
+  then
+    prompt_nocr "$prompt: "
+    typeset response
+    read -s response
+    response=$(fix_xml "$response")
+    # This is a really stupid way of creating the JSON, but it works
+    # (In it's own way, it's almost SQL-injection-ist!
+    action='Answer", "Answer": "'
+    action="$action$response"
+  else
+    prompt "Performing 'Out of Band' authentication, waiting for completion"
+    action=StartOOB
+  fi
+  typeset json=$(printf '{"Action": "%s", "MechanismId": "%s", "TenantId": "%s", "SessionId": "%s"}' "$action" "$mech_id" "$tenant" "$session")
+  typeset auth=$(do_curl /Security/AdvanceAuthentication "$json")
+  auth=$(test_success "$auth" "Authentication $answer_type")
+
+  # If we are OobPending then wait a while
+  while [ "$(echo "$auth" | $JQ -r '.Summary')" == "OobPending" ]
+  do
+    prompt_nocr "."
+    sleep 2
+    json=$(printf '{"Action": "%s", "MechanismId": "%s", "TenantId": "%s", "SessionId": "%s"}' "Poll" "$mech_id" "$tenant" "$session")
+    auth=$(do_curl /Security/AdvanceAuthentication "$json")
+    auth=$(test_success "$auth" "Polling OOB")
+  done
+  # This will hold the bearer token
+  echo "$auth"
+}
+
+############################################################################
+#
+# The SAML from calling the "app click" routine is a horrible XML mess
+# We cheat and just look for lines matching an AWS role arn, and present
+# them in a menu.  Each line of the SAML is in the form "role,provider"
+# which we return to the caller
+#
+############################################################################
+
+select_role()
+{
+  # Let's get a list of roles and providers
+  typeset -a roles
+  typeset -a providers
+
+  while read -r line
+  do
+    roles+=("${line%,*}")
+    providers+=("$line")
+  done < <(echo "$@" | tr '<' '\012' | sed -n 's/^AttributeValue>\(arn:aws:iam:.*:role\)/\1/p')
+
+  typeset role=$(select_options "Select role" "${roles[@]}")
+
+  echo "${providers[$role]}"
+}
+
+############################################################################
+#
+# Main entry point.
+#
+############################################################################
+
+main()
+{
+  setup "$1"
+  start=$(do_start)
+
+  # If this start value has a PodFqdn entry then we're not using the right endpoint name
+  pod=$(echo "$start" | $JQ -r '.PodFqdn')
+  if [ -n "$pod" -a "$pod" != "null" ]
+  then
+    prompt Restarting with new endpoint: $pod
+    ENDPOINT=$pod
+    start=$(do_start)
+  fi
+
+  # These two variables identify the current authentication session.
+  tenant=$(echo "$start" | $JQ -r '.TenantId')
+  session=$(echo "$start" | $JQ -r '.SessionId')
+
+  # Loop while we still have challenges
+  let i=0
+  while [ 1 ]
+  do
+    challenge=$(echo "$start" | $JQ -r '.Challenges['$i'].Mechanisms')
+    if [ "$challenge" == "null" ]
+    then
+      break
+    fi
+    let i=i+1
+    result=$(do_challenge $i $tenant $session "$challenge")
+  done
+
+  # At the end of this, $result should contain the token we can pass to the app caller.
+  auth=$(echo "$result" | $JQ -r '.Auth')
+  if [ -z "$auth" ]
+  then
+    error "Unable to get token after authentication"
+  fi
+
+  # We use this to talk to the application.  Effectively we're doing a screen scrape, which
+  # is really nasty
+  html=$(do_curl_auth "/uprest/handleAppClick?appkey=$APPKEY" "$auth")
+  saml=$(echo "$html" | sed -n 's/.*name="SAMLResponse" value="\([^"]*\)".*/\1/p')
+  if [ -z "$saml" ]
+  then
+    error "Unable to find SAML details after application request"
+  fi
+
+  saml_dec=$(echo "$saml" | $BASE64 -d)
+  if [ -z "$saml_dec" ]
+  then
+    error "Problems with base64 decoding of SAML"
+  fi
+
+  # Select the role the user wants
+  rp=$(select_role "$saml_dec")
+
+  # Role and Provider can be extracted
+  role=${rp%,*}
+  prov=${rp#*,}
+
+  # And now the call to "sts" with the details.  This might fail if the
+  # user takes more than 5 minutes to select the role...
+  tokens=$($AWS sts assume-role-with-saml --role-arn "$role" --principal-arn "$prov" --saml-assertion "$saml")
+
+  # I should probably use jq to extract this information, but this works
+  # well enough!
+  secret=$(echo "" "$tokens" | sed -n 's!.*"SecretAccessKey": "\(.*\)".*!\1!p')
+  session=$(echo "" "$tokens" | sed -n 's!.*"SessionToken": "\(.*\)".*!\1!p')
+  access=$(echo "" "$tokens" | sed -n 's!.*"AccessKeyId": "\(.*\)".*!\1!p')
+  expire=$(echo "" "$tokens" | sed -n 's!.*"Expiration": "\(.*\)".*!\1!p')
+
+  if [ -z "$secret" -o -z "$session" -o -z "$access" ]
+  then
+    error "Unable to get temporary credentials.  Could not find secret/access/session entries
+
+$tokens" 
+  fi
+
+  # And, finally, this is what the caller sees so they can eval $(...)
+  # this program!
+  echo "unset AWS_PROFILE ; export AWS_SESSION_TOKEN=$session AWS_SECRET_ACCESS_KEY=$secret AWS_ACCESS_KEY_ID=$access"
+
+  prompt "Keys valid until $expire"
+}
+
+main "$1"
