@@ -5,7 +5,7 @@ bash script to allow Centrify 2FA to be used to get access tokens to use the aws
 suite.  The one we're interested in, here, is the cloud user portal.
 In this we can configure single sign on connectivity to third party
 applications, e.g. using your AD kerberos ticket.  Typically this
-uses an IDentity Prodiver (IDP) function, and may return a SAML assertion
+uses an IDentity Provider (IDP) function, and may return a SAML assertion
 that is then passed to the application.
 
 One such application is the [AWS Console](https://community.centrify.com/t5/TechBlog/How-To-Integrate-AWS-Console-with-Centrify-Identity-Service-SAML/ba-p/28296).
@@ -77,6 +77,38 @@ It makes it very easy to create a function wrapper
         "UserId": "AROAIHWUHJHJGL23HGSHK:example.user@example.com"
         "Arn": "arn:aws:sts::123456789901:assumed-role/aws_centrify/example.user@example.com"
     }
+
+## How it works
+
+The Centrify API provides a number of endpoints.
+
+First we call `/Security/StartAuthentication`.  This will create a new
+session and return a list of authentication methods that need to be
+completed to allow authentication to succeed.
+
+We go through these one by one, calling `/Security/AdvanceAuthentication`
+with the necessary information.  If this is an "Out-Of-Band"
+authentication (e.g. email, SMS, Mobile) then the program will loop
+polling to see if the authentication has completed.
+
+Once we complete the polling we will receive a Bearer token that can
+be passed to `/uprest/handleAppClick?appkey=$APPKEY`.  This is a little
+messy, and it's effectively screen scraping the results.  But this
+returns SAML code.
+
+Inside the SAML is a list of roles the user can assume.  The user selects
+the role they want, and this is then passed to the `aws sts` command to
+get the session tokens.
+
+## Timing
+
+Out of Band authentication needs to complete in 5 minutes, otherwise it
+is marked as failed.
+
+The SAML token is only valid for 5 minutes, before it expires.
+
+The session generated is time limited (e.g. 1 hour) before the tokens
+need to be renewed.
 
 ## License
 
