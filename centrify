@@ -187,6 +187,12 @@ setup()
   then
     error "Missing dependency: base64"
   fi
+
+  # MacOS base64 uses -D
+  case $(uname -s) in
+    Darwin) BASE64D=D ;;
+         *) BASE64D=d ;;
+  esac
  
   # And the aws command to talk to Amazon
   AWS=$(type -path aws)
@@ -383,7 +389,7 @@ main()
     error "Unable to find SAML details after application request"
   fi
 
-  saml_dec=$(echo "$saml" | $BASE64 -d)
+  saml_dec=$(echo "$saml" | $BASE64 -$BASE64D)
   if [ -z "$saml_dec" ]
   then
     error "Problems with base64 decoding of SAML"
