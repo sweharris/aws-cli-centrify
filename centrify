@@ -258,10 +258,9 @@ do_start()
 
 do_challenge()
 {
-  typeset count=$1
-  typeset tenant=$2
-  typeset session=$3
-  typeset challenge=$4
+  typeset tenant=$1
+  typeset session=$2
+  typeset challenge=$3
 
   # Build the array of options the user can pick
   typeset -a options=()
@@ -361,16 +360,15 @@ main()
   session=$(echo "$start" | $JQ -r '.SessionId')
 
   # Loop while we still have challenges
-  let i=0
+  result=$start
   while [ 1 ]
   do
-    challenge=$(echo "$start" | $JQ -r '.Challenges['$i'].Mechanisms')
-    if [ "$challenge" == "null" ]
+    challenge=$(echo "$result" | $JQ -r '.Challenges[0].Mechanisms')
+    if [ "$challenge" == "null" -o "$challenge" == "" ]
     then
       break
     fi
-    let i=i+1
-    result=$(do_challenge $i $tenant $session "$challenge")
+    result=$(do_challenge $tenant $session "$challenge")
   done
 
   # At the end of this, $result should contain the token we can pass to the app caller.
