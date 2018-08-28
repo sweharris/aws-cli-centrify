@@ -246,6 +246,14 @@ do_start()
   test_success "$start" "Starting Authentication"
 }
 
+# Advance Authentication
+do_advance()
+{
+  typeset json=$(printf '{"Action": "%s", "MechanismId": "%s", "TenantId": "%s", "SessionId": "%s"}' "$1" "$2" "$3" "$4")
+  typeset auth=$(do_curl /Security/AdvanceAuthentication "$json")
+  test_success "$auth" "Authentication $answer_type"
+}
+
 ############################################################################
 #
 # This goes through one element of the "Challenges" array.  The main loop
@@ -288,13 +296,25 @@ do_challenge()
     # (In it's own way, it's almost SQL-injection-ist!
     action='Answer", "Answer": "'
     action="$action$response"
+    auth=$(do_advance "$action" "$mech_id" "$tenant" "$session")
+  elif [ $answer_type == "StartTextOob" ]
+  then
+    auth=$(do_advance "StartOOB" "$mech_id" "$tenant" "$session")
+    prompt "$prompt"
+    prompt_nocr "Either enter the code supplied, or just press return if authentication completed remotely:"
+    typeset response
+    read response
+    if [ -n "$response" ]
+    then
+      response=$(fix_xml "$response")
+      action='Answer", "Answer": "'
+      action="$action$response"
+      auth=$(do_advance "$action" "$mech_id" "$tenant" "$session")
+    fi 
   else
     prompt "Performing 'Out of Band' authentication, waiting for completion"
-    action=StartOOB
+    auth=$(do_advance "StartOOB" "$mech_id" "$tenant" "$session")
   fi
-  typeset json=$(printf '{"Action": "%s", "MechanismId": "%s", "TenantId": "%s", "SessionId": "%s"}' "$action" "$mech_id" "$tenant" "$session")
-  typeset auth=$(do_curl /Security/AdvanceAuthentication "$json")
-  auth=$(test_success "$auth" "Authentication $answer_type")
 
   # If we are OobPending then wait a while
   while [ "$(echo "$auth" | $JQ -r '.Summary')" == "OobPending" ]
